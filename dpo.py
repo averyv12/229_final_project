@@ -118,7 +118,9 @@ def dpo_loss(chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps,
     ref_rejected_logps:  log πref(y⁻ | x)
     """
     logits_diff = (chosen_logps - rejected_logps) - (ref_chosen_logps - ref_rejected_logps)
-    loss = -F.logsigmoid(beta * logits_diff).mean()
+    scaled_diff = beta * logits_diff
+    scaled_diff = torch.clamp(scaled_diff, -20.0, 20.0)
+    loss = -F.logsigmoid(scaled_diff).mean()
     return loss
 
 def compute_sequence_logprob(logits, labels, ignore_index=-100):
@@ -136,7 +138,7 @@ def compute_sequence_logprob(logits, labels, ignore_index=-100):
     token_logprobs = token_logprobs * mask.float()
     return token_logprobs.sum(dim=1)
 
-def train_dpo(model_name,tokenized_dataset,epochs=3,batch_size=1,lr=1e-5,beta=0.7,device="cuda"):
+def train_dpo(model_name,tokenized_dataset,epochs=3,batch_size=2,lr=1e-5,beta=0.6,device="cuda"):
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name)
     model.gradient_checkpointing_enable()
@@ -176,12 +178,6 @@ def train_dpo(model_name,tokenized_dataset,epochs=3,batch_size=1,lr=1e-5,beta=0.
             rejected_labels[rejected_labels == tokenizer.pad_token_id] = -100
 
             # ---- forward pass θ ----
-            # model_chosen = model(input_ids=chosen_ids, labels=chosen_labels)
-            # model_rejected = model(input_ids=rejected_ids, labels=rejected_labels)
-
-            # chosen_logps   = compute_sequence_logprob(model_chosen.logits, chosen_labels)
-            # rejected_logps = compute_sequence_logprob(model_rejected.logits, rejected_labels)
-
             with autocast():  # mixed precision
                 model_chosen   = model(input_ids=chosen_ids, labels=chosen_labels)
                 model_rejected = model(input_ids=rejected_ids, labels=rejected_labels)
@@ -198,7 +194,7 @@ def train_dpo(model_name,tokenized_dataset,epochs=3,batch_size=1,lr=1e-5,beta=0.
                 # compute logprobs on CPU and move result back to GPU
                 ref_chosen_logps_cpu   = compute_sequence_logprob(ref_chosen.logits, chosen_labels.cpu())
                 ref_rejected_logps_cpu = compute_sequence_logprob(ref_rejected.logits, rejected_labels.cpu())
-            
+
             ref_chosen_logps = ref_chosen_logps_cpu.detach().to(device)
             ref_rejected_logps = ref_rejected_logps_cpu.detach().to(device)
 
@@ -206,6 +202,7 @@ def train_dpo(model_name,tokenized_dataset,epochs=3,batch_size=1,lr=1e-5,beta=0.
             loss = dpo_loss(chosen_logps, rejected_logps, ref_chosen_logps, ref_rejected_logps, beta=beta)
 
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -241,12 +238,12 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 output_model.to(device)
 
 def better_prompt(prompt):
-  new_prompt = f"Rewrite the following prompt to be clearer, more helpful, and more structured, but without solving it or adding any steps toward a solution: {prompt}. Output only the improved prompt, nothing else."
+  new_prompt = f"Rewrite the following prompt to be clearer, more helpful, and more structured—without solving it or adding any steps toward a solution. Return only the improved version of the prompt and nothing else: {prompt}"
   inputs = output_tokenizer(new_prompt, return_tensors="pt").to(device)
 
   output_ids = output_model.generate(
       **inputs,
-      max_new_tokens=250,
+      max_new_tokens=256,
       temperature=0.7,
       top_p=0.9,
       do_sample=True,
